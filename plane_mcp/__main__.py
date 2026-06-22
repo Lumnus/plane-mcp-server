@@ -91,13 +91,14 @@ class ServerMode(Enum):
 
 
 @asynccontextmanager
-async def combined_lifespan(oauth_app, header_app, sse_app):
-    """Combine lifespans from both OAuth and Header MCP apps."""
-    # Start both lifespans
-    async with oauth_app.lifespan(oauth_app):
-        async with header_app.lifespan(header_app):
-            async with sse_app.lifespan(sse_app):
-                yield
+async def combined_lifespan(apps):
+    """Combine lifespans across the mounted MCP apps (variable set)."""
+    from contextlib import AsyncExitStack
+
+    async with AsyncExitStack() as stack:
+        for sub_app in apps:
+            await stack.enter_async_context(sub_app.lifespan(sub_app))
+        yield
 
 
 def main() -> None:
@@ -119,30 +120,37 @@ def main() -> None:
     if server_mode == ServerMode.HTTP:
         prefix = os.getenv("MCP_PATH_PREFIX") or ""
 
-        oauth_mcp = get_oauth_mcp(prefix + "/http")
-        oauth_app = oauth_mcp.http_app(stateless_http=True)
+        # Lumnus fork customization (run 2026-W26/2026-06-22-plane-epics-full-stack):
+        # Header-auth (x-api-key + x-workspace-slug per request) is ALWAYS available.
+        # OAuth + SSE require an OAuth provider client_id; mount them only when
+        # PLANE_OAUTH_PROVIDER_CLIENT_ID is configured, so the server runs
+        # header-auth-only for substrate-internal use without an OAuth client.
         header_app = get_header_mcp().http_app(stateless_http=True)
+        routes = [Mount(prefix + "/http/api-key", app=header_app)]
+        lifespan_apps = [header_app]
 
-        sse_mcp = get_oauth_mcp(prefix)
-        sse_app = sse_mcp.http_app(transport="sse")
-
-        # mcp_path is appended to the auth provider's base_url to form the
-        # advertised resource URL. base_url already carries the prefix, so these
-        # stay at /mcp and /sse to avoid double-prefixing.
-        oauth_well_known = oauth_mcp.auth.get_well_known_routes(mcp_path="/mcp")
-        sse_well_known = sse_mcp.auth.get_well_known_routes(mcp_path="/sse")
-
-        app = Starlette(
-            routes=[
-                # Well-known routes for OAuth and Header HTTP
+        if os.getenv("PLANE_OAUTH_PROVIDER_CLIENT_ID"):
+            oauth_mcp = get_oauth_mcp(prefix + "/http")
+            oauth_app = oauth_mcp.http_app(stateless_http=True)
+            sse_mcp = get_oauth_mcp(prefix)
+            sse_app = sse_mcp.http_app(transport="sse")
+            # mcp_path is appended to the auth provider's base_url to form the
+            # advertised resource URL. base_url already carries the prefix, so these
+            # stay at /mcp and /sse to avoid double-prefixing.
+            oauth_well_known = oauth_mcp.auth.get_well_known_routes(mcp_path="/mcp")
+            sse_well_known = sse_mcp.auth.get_well_known_routes(mcp_path="/sse")
+            routes = [
                 *oauth_well_known,
                 *sse_well_known,
-                # Mount both MCP servers
                 Mount(prefix + "/http/api-key", app=header_app),
                 Mount(prefix + "/http", app=oauth_app),
                 Mount(prefix or "/", app=sse_app),
-            ],
-            lifespan=lambda app: combined_lifespan(oauth_app, header_app, sse_app),
+            ]
+            lifespan_apps = [oauth_app, header_app, sse_app]
+
+        app = Starlette(
+            routes=routes,
+            lifespan=lambda app: combined_lifespan(lifespan_apps),
         )
 
         app.add_middleware(
